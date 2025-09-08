@@ -19,19 +19,11 @@
 //   uint64_t total_tx_delta;
 //   uint16_t ip_count;
 // followed by ip entries (repeated ip_count times):
-//   uint8_t ipv4; (value 4)
+//   uint8_t ipv; (value 4)
 //   uint8_t pad;
 //   uint32_t addr; // network order
 //   uint64_t rx_delta;
 //   uint64_t tx_delta;
-
-struct __attribute__((packed)) ip_entry_on_disk {
-    uint8_t ipv4;
-    uint8_t pad;
-    uint32_t addr;
-    uint64_t rx_delta;
-    uint64_t tx_delta;
-};
 
 int ensure_dir(const char *path) {
     struct stat st;
@@ -80,14 +72,14 @@ int storage_append_daily(const char *root_dir, const char *iface,
     if (write(tfd, &ip_count, sizeof(ip_count)) != sizeof(ip_count)) { close(tfd); unlink(tmpfile); return -1; }
 
     // write ip entries (we transform to on-disk structure)
-    const struct ip_counter *ip_entries = (const struct ip_counter*)ip_entries_void;
+    const struct ip_record *ip_entries = (const struct ip_record*)ip_entries_void;
     for (int i = 0; i < ip_count; ++i) {
         struct ip_entry_on_disk e;
-        e.ipv4 = 4;
+        e.ipv = 4;
         e.pad = 0;
         e.addr = ip_entries[i].ip; // network order already
-        e.rx_delta = ip_entries[i].rx_bytes;
-        e.tx_delta = ip_entries[i].tx_bytes;
+        e.rx_delta = ip_entries[i].rx;
+        e.tx_delta = ip_entries[i].tx;
         if (write(tfd, &e, sizeof(e)) != sizeof(e)) { close(tfd); unlink(tmpfile); return -1; }
     }
 
