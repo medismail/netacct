@@ -1,7 +1,7 @@
 NAME := $(notdir $(shell pwd))
 CC = gcc
-CFLAGS = -O2 -Wall -pthread -Iinclude `pkg-config --cflags libpcap libcjson`
-LDFLAGS = `pkg-config --libs libpcap libcjson`
+CFLAGS = -O2 -Wall -pthread -Iinclude `pkg-config --cflags libpcap libcjson zlib`
+LDFLAGS = `pkg-config --libs libpcap libcjson zlib`
 OBJDIR := obj
 SRCDIR := src
 BINDIR := bin

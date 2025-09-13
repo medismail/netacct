@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <errno.h>
+#include <zlib.h>
 
 #include "netacct.h"
 
@@ -44,6 +45,62 @@ static void make_date(char *out, size_t n, time_t ts) {
     strftime(out, n, "%Y-%m-%d", &gm);
 }
 
+static int compress_old_file(const char *root, uint32_t ts) {
+    // yesterday
+    char yesterday[32];
+    ts -= 86400; // subtract one day
+    make_date(yesterday, sizeof(yesterday), ts);
+
+    char yesterday_file[1024], yesterday_gz[1024];
+    snprintf(yesterday_file, sizeof(yesterday_file), "%s/%s.bin", root, yesterday);
+    snprintf(yesterday_gz, sizeof(yesterday_gz), "%s/%s.bin.gz", root, yesterday);
+
+    // if yesterday.bin still exists and yesterday.bin.gz does not → compress it
+    if (access(yesterday_file, F_OK) == 0 && access(yesterday_gz, F_OK) != 0) {
+        // compress a finished daily file into gzip and remove original
+        FILE *in = fopen(yesterday_file, "rb");
+        if (!in) {
+            perror("fopen in");
+            return -1;
+        }
+
+        gzFile out = gzopen(yesterday_gz, "wb9"); // best compression
+        if (!out) {
+            perror("gzopen out");
+            fclose(in);
+            return -1;
+        }
+
+        char buf[8192];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+            if (gzwrite(out, buf, (unsigned)n) != (int)n) {
+                fprintf(stderr, "[storage] gzip write error: %s\n", gzerror(out, NULL));
+                gzclose(out);
+                fclose(in);
+                unlink(yesterday_gz);
+                return -1;
+            }
+        }
+
+        fclose(in);
+        if (gzclose(out) != Z_OK) {
+            fprintf(stderr, "[storage] gzclose error\n");
+            unlink(yesterday_gz);
+            return -1;
+        }
+
+        // remove original file after success
+        if (unlink(yesterday_file) != 0) {
+            perror("unlink");
+            return -1;
+        }
+
+        fprintf(stderr, "[storage] Compressed %s → %s\n", yesterday_file, yesterday_gz);
+    }
+    return 0;
+}
+
 int storage_append_daily(const char *root_dir, const char *iface,
                          uint32_t ts, uint64_t rx_delta, uint64_t tx_delta,
                          uint16_t ip_count, const void *ip_entries_void, size_t ip_entries_len)
@@ -57,6 +114,12 @@ int storage_append_daily(const char *root_dir, const char *iface,
     // target file path
     char filepath[1024];
     snprintf(filepath, sizeof(filepath), "%s/%s.bin", daily_dir, date);
+
+    // if today's file exists → assume yesterday already rotated
+    if (access(filepath, F_OK)) {
+        compress_old_file(daily_dir, ts);
+    }
+
 
     // write record to a temporary journal file
     char tmpfile[1024];
