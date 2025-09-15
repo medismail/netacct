@@ -1,121 +1,222 @@
-// reader.c
+// reader.c - daily / monthly network usage report
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <arpa/inet.h>
 #include <string.h>
-#include <inttypes.h>
-#include <netinet/in.h>
+#include <dirent.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <zlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <time.h>
 
 #include "netacct.h"
 
-/*struct ip_entry_on_disk {
-    uint8_t  ipv;
-    uint8_t  pad;
-    uint32_t addr;      // network byte order
-    uint64_t rx_delta;
-    uint64_t tx_delta;
-} __attribute__((packed));*/
+#define HASH_SIZE 256
 
-#define MAX_IPS 512
+struct record_header {
+    uint32_t ts;          // epoch seconds
+    uint64_t total_rx;
+    uint64_t total_tx;
+    uint16_t ip_count;
+} __attribute__((packed));
+
+struct ip_total {
+    uint32_t ip;
+    uint64_t rx;
+    uint64_t tx;
+    struct ip_total *next;
+};
+
+static struct ip_total *totals[HASH_SIZE];
+static uint64_t kernel_rx_total = 0;
+static uint64_t kernel_tx_total = 0;
+
+static struct ip_total *get_total(uint32_t ip) {
+    unsigned h = ip % HASH_SIZE;
+    for (struct ip_total *e = totals[h]; e; e = e->next) {
+        if (e->ip == ip) return e;
+    }
+    struct ip_total *e = calloc(1, sizeof(*e));
+    e->ip = ip;
+    e->next = totals[h];
+    totals[h] = e;
+    return e;
+}
+
+static void clear_totals() {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        struct ip_total *e = totals[i];
+        while (e) {
+            struct ip_total *n = e->next;
+            free(e);
+            e = n;
+        }
+        totals[i] = NULL;
+    }
+}
+
+static void *open_daily_file(const char *path, int *is_gzip) {
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        *is_gzip = 0;
+        return f;
+    }
+    char gzpath[1024];
+    snprintf(gzpath, sizeof(gzpath), "%s.gz", path);
+    gzFile gzf = gzopen(gzpath, "rb");
+    if (gzf) {
+        *is_gzip = 1;
+        return gzf;
+    }
+    return NULL;
+}
+
+static size_t daily_read(void *fh, int is_gzip, void *buf, size_t len) {
+    if (is_gzip) {
+        int n = gzread((gzFile)fh, buf, (unsigned)len);
+        return (n < 0) ? 0 : (size_t)n;
+    } else {
+        return fread(buf, 1, len, (FILE*)fh);
+    }
+}
+
+static void daily_close(void *fh, int is_gzip) {
+    if (is_gzip) gzclose((gzFile)fh);
+    else fclose((FILE*)fh);
+}
+
+static void process_file(const char *path) {
+    int is_gzip = 0;
+    void *fh = open_daily_file(path, &is_gzip);
+    if (!fh) return;
+
+    struct record_header h;
+    while (daily_read(fh, is_gzip, &h, sizeof(h)) == sizeof(h)) {
+        kernel_rx_total += h.total_rx;
+        kernel_tx_total += h.total_tx;
+
+        for (int i = 0; i < h.ip_count; i++) {
+            struct ip_entry_on_disk rec;
+            if (daily_read(fh, is_gzip, &rec, sizeof(rec)) != sizeof(rec)) break;
+            if (rec.ipv == 4) {
+                struct ip_total *t = get_total(rec.addr);
+                t->rx += rec.rx_delta;
+                t->tx += rec.tx_delta;
+            }
+        }
+    }
+
+    daily_close(fh, is_gzip);
+}
+
+static void print_totals(const char *label) {
+    uint64_t grand_rx = 0, grand_tx = 0;
+
+    for (int i = 0; i < HASH_SIZE; i++) {
+        for (struct ip_total *e = totals[i]; e; e = e->next) {
+            grand_rx += e->rx;
+            grand_tx += e->tx;
+        }
+    }
+
+    double kernel_mb = (double)(kernel_rx_total + kernel_tx_total) / (1024.0*1024.0);
+
+    printf("=== %s ===\n", label);
+    for (int i = 0; i < HASH_SIZE; i++) {
+        for (struct ip_total *e = totals[i]; e; e = e->next) {
+            struct in_addr a = { .s_addr = e->ip };
+            double mb = (double)(e->rx + e->tx) / (1024.0*1024.0);
+            double pct = kernel_mb > 0 ? (mb / kernel_mb) * 100.0 : 0.0;
+
+            printf("  %-15s  RX: %.2f MB  TX: %.2f MB  Total: %.2f MB (%.1f%%)\n",
+                   inet_ntoa(a),
+                   (double)e->rx / (1024.0*1024.0),
+                   (double)e->tx / (1024.0*1024.0),
+                   mb, pct);
+        }
+    }
+    double grand_mb = (double)(grand_rx+grand_tx) / (1024.0*1024.0);
+    double pct = kernel_mb > 0 ? ( grand_mb/ kernel_mb) * 100.0 : 0.0;
+    printf("  %-15s  RX: %.2f MB  TX: %.2f MB  Total: %.2f MB (%.1f%%)\n",
+           "ALL (per-IP)",
+           (double)grand_rx / (1024.0*1024.0),
+           (double)grand_tx / (1024.0*1024.0),
+           (double)(grand_rx+grand_tx)/(1024.0*1024.0), pct);
+    printf("  %-15s  RX: %.2f MB  TX: %.2f MB  Total: %.2f MB (100%% kernel)\n",
+           "KERNEL",
+           (double)kernel_rx_total / (1024.0*1024.0),
+           (double)kernel_tx_total / (1024.0*1024.0),
+           kernel_mb);
+}
+
+static int is_datafile(const char *name) {
+    return (strstr(name, ".bin") || strstr(name, ".bin.gz"));
+}
+
+static void daily_report(const char *dirpath) {
+    DIR *d = opendir(dirpath);
+    if (!d) {
+        perror("opendir");
+        return;
+    }
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!is_datafile(de->d_name)) continue;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dirpath, de->d_name);
+
+        // reset totals for each file/day
+        clear_totals();
+        process_file(path);
+
+        // label by filename prefix (YYYYMMDD)
+        char day[257] = {0};
+        strncpy(day, de->d_name, 256);
+        print_totals(day);
+    }
+    closedir(d);
+}
+
+static void monthly_report(const char *dirpath) {
+    DIR *d = opendir(dirpath);
+    if (!d) {
+        perror("opendir");
+        return;
+    }
+
+    clear_totals();
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!is_datafile(de->d_name)) continue;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dirpath, de->d_name);
+        process_file(path);
+    }
+    closedir(d);
+
+    print_totals("Monthly");
+}
 
 int reporter_run(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <dailyfile.bin>\n", argv[0]);
-        return 2;
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <directory> <daily|monthly>\n", argv[0]);
+        return 1;
     }
 
-    FILE *f = fopen(argv[1], "rb");
-    if (!f) { perror("fopen"); return 1; }
-
-    struct ip_record totals[MAX_IPS];
-    int n_totals = 0;
-
-    uint64_t kernel_total_rx = 0;
-    uint64_t kernel_total_tx = 0;
-
-    while (1) {
-        uint32_t ts;
-        uint64_t total_rx_delta;
-        uint64_t total_tx_delta;
-        uint16_t ip_count;
-
-        /* Read header fields individually to avoid struct padding issues */
-        if (fread(&ts, sizeof(ts), 1, f) != 1) break;
-        if (fread(&total_rx_delta, sizeof(total_rx_delta), 1, f) != 1) {
-            fprintf(stderr, "Unexpected EOF reading total_rx\n"); fclose(f); return 1;
-        }
-        if (fread(&total_tx_delta, sizeof(total_tx_delta), 1, f) != 1) {
-            fprintf(stderr, "Unexpected EOF reading total_tx\n"); fclose(f); return 1;
-        }
-        if (fread(&ip_count, sizeof(ip_count), 1, f) != 1) {
-            fprintf(stderr, "Unexpected EOF reading ip_count\n"); fclose(f); return 1;
-        }
-
-        kernel_total_rx += total_rx_delta;
-        kernel_total_tx += total_tx_delta;
-
-        for (uint16_t i = 0; i < ip_count; ++i) {
-            struct ip_entry_on_disk e;
-            if (fread(&e, sizeof(e), 1, f) != 1) {
-                fprintf(stderr, "Unexpected EOF reading ip_entry\n");
-                fclose(f);
-                return 1;
-            }
-            if (e.ipv != 4) continue; // skip non-IPv4 entries (future-proof)
-
-            /* Try to find existing entry */
-            int found = -1;
-            for (int j = 0; j < n_totals; ++j) {
-                if (totals[j].ip == e.addr) { found = j; break; }
-            }
-            if (found == -1) {
-                if (n_totals >= MAX_IPS) {
-                    fprintf(stderr, "Too many unique IPs (> %d)\n", MAX_IPS);
-                    fclose(f);
-                    return 1;
-                }
-                totals[n_totals].ip = e.addr;
-                totals[n_totals].rx = e.rx_delta;
-                totals[n_totals].tx = e.tx_delta;
-                n_totals++;
-            } else {
-                totals[found].rx += e.rx_delta;
-                totals[found].tx += e.tx_delta;
-            }
-        }
-    }
-
-    fclose(f);
-
-    /* Print results */
-    printf("%-15s %-15s %-15s %-15s\n",
-           "IP Address", "RX Bytes", "TX Bytes", "Total");
-    uint64_t sum_ips_rx = 0, sum_ips_tx = 0;
-    for (int i = 0; i < n_totals; ++i) {
-        struct in_addr a; a.s_addr = totals[i].ip;
-        char ipbuf[INET_ADDRSTRLEN];
-        if (!inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf))) strncpy(ipbuf, "???", sizeof(ipbuf));
-        uint64_t total = totals[i].rx + totals[i].tx;
-        printf("%-15s %-15" PRIu64 " %-15" PRIu64 " %-15" PRIu64 "\n",
-               ipbuf, totals[i].rx, totals[i].tx, total);
-        sum_ips_rx += totals[i].rx;
-        sum_ips_tx += totals[i].tx;
-    }
-
-    printf("\nKernel totals (accumulated from header fields):\n");
-    printf("  RX: %" PRIu64 "  TX: %" PRIu64 "\n", kernel_total_rx, kernel_total_tx);
-    printf("Sum of per-IP deltas: RX: %" PRIu64 "  TX: %" PRIu64 "\n", sum_ips_rx, sum_ips_tx);
-
-    if (kernel_total_rx > 0) {
-        double pct_rx = 100.0 * (double)(kernel_total_rx - sum_ips_rx) / (double)kernel_total_rx;
-        printf("Unattributed RX = %" PRIu64 " (%.4f%% of kernel RX)\n",
-               (kernel_total_rx > sum_ips_rx) ? (kernel_total_rx - sum_ips_rx) : 0UL, pct_rx);
-    }
-    if (kernel_total_tx > 0) {
-        double pct_tx = 100.0 * (double)(kernel_total_tx - sum_ips_tx) / (double)kernel_total_tx;
-        printf("Unattributed TX = %" PRIu64 " (%.4f%% of kernel TX)\n",
-               (kernel_total_tx > sum_ips_tx) ? (kernel_total_tx - sum_ips_tx) : 0UL, pct_tx);
+    if (strcmp(argv[2], "daily") == 0) {
+        daily_report(argv[1]);
+    } else if (strcmp(argv[2], "monthly") == 0) {
+        monthly_report(argv[1]);
+    } else {
+        fprintf(stderr, "Unknown report type: %s\n", argv[2]);
+        return 1;
     }
 
     return 0;
