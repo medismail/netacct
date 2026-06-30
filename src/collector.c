@@ -2,109 +2,148 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <time.h>
 
 #include "netacct.h"
 
-// Forwarded functions
-int pcap_start_for_iface_threaded(const char *iface);
-extern void *poller_thread_fn(void *arg);
-extern void *control_thread_fn(void *arg);
-extern void ipacct_snapshot_and_clear(uint64_t*,uint64_t*,struct ip_record*,int*);
-extern int ipacct_accumulate_kernel_delta(uint64_t rx_delta, uint64_t tx_delta);
+extern struct iface_counters g_iface;
+volatile sig_atomic_t netacct_running = 1;
 
-static volatile int running = 1;
-
-void sigint_handler(int sig) { (void)sig; running = 0; }
-
+static void handle_signal(int sig) {
+    (void)sig;
+    netacct_running = 0;
+    pcap_request_stop();
+}
 
 int collector_init(struct cfg *cfg) {
-    // init global structures: set mutex
-    extern struct iface_counters g_iface;
+    if (!cfg) return -1;
+
+    if (!cfg->has_local_net) {
+        if (detect_iface_ipv4_network(cfg->iface, &cfg->local_net, &cfg->local_mask,
+                                      cfg->subnet_text, sizeof(cfg->subnet_text)) != 0) {
+            fprintf(stderr,
+                    "[collector] cannot auto-detect IPv4 subnet for %s. Use --subnet A.B.C.D/MASK\n",
+                    cfg->iface);
+            return -1;
+        }
+        cfg->has_local_net = 1;
+    }
+
     memset(&g_iface, 0, sizeof(g_iface));
-    pthread_mutex_init(&g_iface.lock, NULL);
-    g_iface.kernel_rx_delta = 0;
-    g_iface.kernel_tx_delta = 0;
-    g_iface.last_kernel_rx = 0;
-    g_iface.last_kernel_tx = 0;
+    snprintf(g_iface.name, sizeof(g_iface.name), "%s", cfg->iface);
+    if (pthread_mutex_init(&g_iface.lock, NULL) != 0) {
+        perror("pthread_mutex_init");
+        return -1;
+    }
     return 0;
 }
 
-void *pcap_thread_fn(void *arg) {
-    struct cfg *cfg = arg;
-    pcap_start_for_iface_threaded(cfg->iface);
-    return NULL;
+static void *pcap_thread_fn(void *arg) {
+    return (void *)(intptr_t)pcap_start_for_iface_threaded((struct cfg *)arg);
 }
 
-void *flush_thread_fn(void *arg) {
-    struct cfg *cfg = arg;
-    int interval = cfg->flush_interval;
-    while (running) {
-        sleep(interval);
+static void log_flush_stats(uint32_t ts, uint64_t kernel_rx, uint64_t kernel_tx, int ipn) {
+    struct pcap_runtime_stats ps;
+    pcap_get_runtime_stats(&ps);
+    fprintf(stderr,
+            "[flush] ts=%u kernel_rx=%llu kernel_tx=%llu ip_records=%d pcap_recv=%u pcap_drop=%u pcap_ifdrop=%u accounted_l2=%llu\n",
+            ts,
+            (unsigned long long)kernel_rx,
+            (unsigned long long)kernel_tx,
+            ipn,
+            ps.pcap_recv,
+            ps.pcap_drop,
+            ps.pcap_ifdrop,
+            (unsigned long long)ps.accounted_bytes);
+}
 
-        time_t now = time(NULL);
-        uint64_t kernel_rx = 0, kernel_tx = 0;
-        struct ip_record ips[MAX_IP_ENTRIES];
-        int ipn = 0;
-        // snapshot and clear
-        ipacct_snapshot_and_clear(&kernel_rx, &kernel_tx, ips, &ipn);
-
-        // append to storage
-        if (kernel_rx == 0 && kernel_tx == 0 && ipn == 0) continue; // nothing to write
-        if (storage_append_daily(cfg->root_dir, cfg->iface, (uint32_t)now,
-                                 kernel_rx, kernel_tx, (uint16_t)ipn,
-                                 ips, sizeof(struct ip_record)*ipn) != 0) {
-            fprintf(stderr, "storage append failed\n");
-        } else {
-            printf("flushed %u: kernel_rx=%lu kernel_tx=%lu ipn=%d\n",
-                   (unsigned)now, kernel_rx, kernel_tx, ipn);
-        }
-    }
-    // final flush before exit
+static int flush_once(struct cfg *cfg, int final) {
     time_t now = time(NULL);
     uint64_t kernel_rx = 0, kernel_tx = 0;
     struct ip_record ips[MAX_IP_ENTRIES];
     int ipn = 0;
+
     ipacct_snapshot_and_clear(&kernel_rx, &kernel_tx, ips, &ipn);
-    if (kernel_rx || kernel_tx || ipn) {
-        storage_append_daily(cfg->root_dir, cfg->iface, (uint32_t)now,
-                             kernel_rx, kernel_tx, (uint16_t)ipn,
-                             ips, sizeof(struct ip_record)*ipn);
+    if (kernel_rx == 0 && kernel_tx == 0 && ipn == 0) {
+        if (final) poller_persist_last_counts(cfg);
+        return 0;
     }
+
+    if (storage_append_daily(cfg->root_dir, cfg->iface, (uint32_t)now,
+                             kernel_rx, kernel_tx, (uint16_t)ipn,
+                             ips, sizeof(struct ip_record) * (size_t)ipn) != 0) {
+        fprintf(stderr, "[flush] storage append failed; keeping last persisted counters unchanged\n");
+        return -1;
+    }
+
+    if (poller_persist_last_counts(cfg) != 0) {
+        fprintf(stderr, "[flush] warning: failed to persist last kernel counters\n");
+    }
+
+    log_flush_stats((uint32_t)now, kernel_rx, kernel_tx, ipn);
+    return 0;
+}
+
+static void *flush_thread_fn(void *arg) {
+    struct cfg *cfg = (struct cfg *)arg;
+    while (netacct_running) {
+        for (int i = 0; i < cfg->flush_interval && netacct_running; i++) sleep(1);
+        if (!netacct_running) break;
+        flush_once(cfg, 0);
+    }
+    flush_once(cfg, 1);
     return NULL;
 }
 
 int collector_run(struct cfg *cfg) {
-
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
-
-    // for testing add a local IP (replace with your local IP)
-    uint32_t myip;
-    inet_pton(AF_INET, "172.16.3.66", &myip);
-    ipacct_add_client(myip);
-    /*ipacct_add_local(cfg->iface, myip);*/
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
 
     pthread_t pcap_thread, poll_thread, flush_thread, control_thread;
-    pthread_create(&pcap_thread, NULL, pcap_thread_fn, cfg);
-    pthread_create(&poll_thread, NULL, poller_thread_fn, cfg);
-    pthread_create(&control_thread, NULL, control_thread_fn, cfg);
-    pthread_create(&flush_thread, NULL, flush_thread_fn, cfg);
+    int control_started = 0;
 
-    while (running) sleep(1);
+    if (pthread_create(&pcap_thread, NULL, pcap_thread_fn, cfg) != 0) {
+        perror("pthread_create pcap");
+        return 1;
+    }
+    if (pthread_create(&poll_thread, NULL, poller_thread_fn, cfg) != 0) {
+        perror("pthread_create poller");
+        netacct_running = 0;
+        pcap_request_stop();
+        pthread_join(pcap_thread, NULL);
+        return 1;
+    }
+    if (pthread_create(&flush_thread, NULL, flush_thread_fn, cfg) != 0) {
+        perror("pthread_create flush");
+        netacct_running = 0;
+        pcap_request_stop();
+        pthread_join(pcap_thread, NULL);
+        pthread_join(poll_thread, NULL);
+        return 1;
+    }
 
-    // attempt graceful shutdown: stop pcap loop by breaking pcap_loop isn't trivial here,
-    // but program exiting will close handle; join threads
-    pthread_cancel(pcap_thread); // best-effort
+    if (pthread_create(&control_thread, NULL, control_thread_fn, cfg) != 0) {
+        fprintf(stderr, "[control] disabled: cannot start control thread\n");
+        control_started = 0;
+    } else {
+        control_started = 1;
+    }
+
+    while (netacct_running) sleep(1);
+
+    pcap_request_stop();
     pthread_join(pcap_thread, NULL);
-    pthread_cancel(poll_thread);
     pthread_join(poll_thread, NULL);
     pthread_join(flush_thread, NULL);
-    pthread_cancel(control_thread);
-    pthread_join(control_thread, NULL);
 
+    if (control_started) {
+        pthread_cancel(control_thread);
+        pthread_join(control_thread, NULL);
+    }
+
+    fprintf(stderr, "[netacct] stopped\n");
     return 0;
 }
