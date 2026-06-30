@@ -1,32 +1,49 @@
-NAME := $(notdir $(shell pwd))
-CC = gcc
-CFLAGS = -O2 -Wall -pthread -Iinclude `pkg-config --cflags libpcap libcjson zlib`
-LDFLAGS = `pkg-config --libs libpcap libcjson zlib`
+NAME := netacct
+CC ?= gcc
+PKG_CFLAGS := $(shell pkg-config --cflags libpcap libcjson zlib 2>/dev/null)
+PKG_LIBS := $(shell pkg-config --libs libpcap libcjson zlib 2>/dev/null)
+CFLAGS ?= -O2 -Wall -Wextra -Wpedantic -std=c11 -pthread -Iinclude $(PKG_CFLAGS)
+LDFLAGS ?= $(PKG_LIBS) -pthread
 OBJDIR := obj
 SRCDIR := src
 BINDIR := bin
-DIRS := $(OBJDIR) $(BINDIR)
 BIN := $(BINDIR)/$(NAME)
-OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(wildcard $(SRCDIR)/*.c))
-#SRCS = src/main.c src/collector.c src/ipacct.c src/pcap_if.c src/poller.c src/storage.c src/control.c
-#OBJS = $(SRCS:.c=.o)
-MKDIR_P := mkdir -p
+SRCS := $(wildcard $(SRCDIR)/*.c)
+OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
+PREFIX ?= /usr/local
+SYSCONFDIR ?= /etc
+LOCALSTATEDIR ?= /var/lib
+SYSTEMDDIR ?= /etc/systemd/system
 
-.PHONY: all
+.PHONY: all clean install uninstall check-deps
 
-all: $(BIN)
+all: check-deps $(BIN)
 
-#netacct: $(OBJS)
-#	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+check-deps:
+	@pkg-config --exists libpcap libcjson zlib || \
+	 (echo "Missing dependencies. On Debian/Raspberry Pi OS: sudo apt install build-essential pkg-config libpcap-dev libcjson-dev zlib1g-dev" >&2; exit 1)
 
-$(BIN): ${DIRS} $(OBJS)
+$(BIN): $(OBJS) | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
-$(OBJDIR)/%.o: $(SRCDIR)/%.c
+$(OBJDIR)/%.o: $(SRCDIR)/%.c include/netacct.h | $(OBJDIR)
 	$(CC) $(CFLAGS) -o $@ -c $<
 
-clean:
-	rm -f $(BIN) $(OBJS)
+$(OBJDIR) $(BINDIR):
+	mkdir -p $@
 
-${DIRS}:
-	$(MKDIR_P) $(DIRS)
+install: all
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/netacct
+	install -d $(DESTDIR)$(SYSCONFDIR)
+	install -m 0644 etc/netacct.conf.example $(DESTDIR)$(SYSCONFDIR)/netacct.conf
+	install -d $(DESTDIR)$(LOCALSTATEDIR)/netacct
+	install -d $(DESTDIR)$(SYSTEMDDIR)
+	install -m 0644 systemd/netacct.service $(DESTDIR)$(SYSTEMDDIR)/netacct.service
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/netacct
+	rm -f $(DESTDIR)$(SYSTEMDDIR)/netacct.service
+
+clean:
+	rm -rf $(OBJDIR) $(BINDIR)
