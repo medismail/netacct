@@ -10,6 +10,10 @@
 #define ETHERTYPE_IP 0x0800
 #endif
 
+#ifndef ETHERTYPE_IPV6
+#define ETHERTYPE_IPV6 0x86DD
+#endif
+
 static const struct cfg *g_cfg = NULL;
 static pcap_t *g_handle = NULL;
 static struct pcap_runtime_stats g_stats;
@@ -35,16 +39,7 @@ static uint16_t read_be16(const u_char *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 
-static void packet_handler(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
-    const struct cfg *cfg = (const struct cfg *)user;
-    g_stats.packets_seen++;
-
-    if (h->caplen < 34) return;
-    uint16_t ethertype = read_be16(bytes + 12);
-    if (ethertype != ETHERTYPE_IP) return;
-
-    const u_char *ip = bytes + 14;
-    size_t ip_avail = h->caplen - 14;
+static void account_ipv4_packet(const struct cfg *cfg, const struct pcap_pkthdr *h, const u_char *ip, size_t ip_avail) {
     uint8_t version = ip[0] >> 4;
     size_t ihl = (size_t)(ip[0] & 0x0fu) * 4u;
     if (version != 4 || ihl < 20 || ihl > ip_avail) return;
@@ -59,11 +54,11 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *h, const u_ch
     int accounted = 0;
 
     if (cfg_ip_is_local(cfg, src)) {
-        ipacct_update_tx(cfg->iface, src, bytes_on_iface);
+        ipacct_update_tx(cfg->iface, NETACCT_IPV4, &src, bytes_on_iface);
         accounted = 1;
     }
     if (cfg_ip_is_local(cfg, dst)) {
-        ipacct_update_rx(cfg->iface, dst, bytes_on_iface);
+        ipacct_update_rx(cfg->iface, NETACCT_IPV4, &dst, bytes_on_iface);
         accounted = 1;
     }
 
@@ -71,6 +66,46 @@ static void packet_handler(u_char *user, const struct pcap_pkthdr *h, const u_ch
         g_stats.local_packets++;
         g_stats.accounted_bytes += bytes_on_iface;
     }
+}
+
+static void account_ipv6_packet(const struct cfg *cfg, const struct pcap_pkthdr *h, const u_char *ip, size_t ip_avail) {
+    if (ip_avail < 40) return;
+    uint8_t version = ip[0] >> 4;
+    if (version != 6) return;
+
+    g_stats.ipv6_packets++;
+
+    const uint8_t *src = ip + 8;
+    const uint8_t *dst = ip + 24;
+    uint32_t bytes_on_iface = h->len;
+    int accounted = 0;
+
+    if (cfg_ip6_is_local(cfg, src)) {
+        ipacct_update_tx(cfg->iface, NETACCT_IPV6, src, bytes_on_iface);
+        accounted = 1;
+    }
+    if (cfg_ip6_is_local(cfg, dst)) {
+        ipacct_update_rx(cfg->iface, NETACCT_IPV6, dst, bytes_on_iface);
+        accounted = 1;
+    }
+
+    if (accounted) {
+        g_stats.local_packets++;
+        g_stats.accounted_bytes += bytes_on_iface;
+    }
+}
+
+static void packet_handler(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
+    const struct cfg *cfg = (const struct cfg *)user;
+    g_stats.packets_seen++;
+
+    if (h->caplen < 14) return;
+    uint16_t ethertype = read_be16(bytes + 12);
+    const u_char *l3 = bytes + 14;
+    size_t l3_avail = h->caplen - 14;
+
+    if (ethertype == ETHERTYPE_IP) account_ipv4_packet(cfg, h, l3, l3_avail);
+    else if (ethertype == ETHERTYPE_IPV6) account_ipv6_packet(cfg, h, l3, l3_avail);
 }
 
 int pcap_start_for_iface_threaded(struct cfg *cfg) {
@@ -104,7 +139,7 @@ int pcap_start_for_iface_threaded(struct cfg *cfg) {
     if (rc > 0) fprintf(stderr, "[pcap] activate warning on %s: %s\n", cfg->iface, pcap_statustostr(rc));
 
     struct bpf_program fp;
-    if (pcap_compile(g_handle, &fp, "ip", 1, PCAP_NETMASK_UNKNOWN) == -1) {
+    if (pcap_compile(g_handle, &fp, "ip or ip6", 1, PCAP_NETMASK_UNKNOWN) == -1) {
         fprintf(stderr, "[pcap] compile failed: %s\n", pcap_geterr(g_handle));
         pcap_close(g_handle);
         g_handle = NULL;
@@ -119,7 +154,7 @@ int pcap_start_for_iface_threaded(struct cfg *cfg) {
     }
     pcap_freecode(&fp);
 
-    fprintf(stderr, "[pcap] capturing IPv4 on %s with %d MB buffer\n", cfg->iface, cfg->pcap_buffer_mb);
+    fprintf(stderr, "[pcap] capturing IPv4/IPv6 on %s with %d MB buffer\n", cfg->iface, cfg->pcap_buffer_mb);
 
     while (netacct_running) {
         rc = pcap_dispatch(g_handle, 128, packet_handler, (u_char *)g_cfg);
