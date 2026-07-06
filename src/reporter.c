@@ -39,6 +39,7 @@ struct report_opts {
     char month[16];
     char format[16];
     int top_n;
+    int human;
 };
 
 struct row {
@@ -196,6 +197,27 @@ static double pct(uint64_t part, uint64_t total) {
     return total ? ((double)part * 100.0 / (double)total) : 0.0;
 }
 
+static const char *format_bytes(uint64_t bytes, int human, char *buf, size_t len) {
+    if (!human) {
+        snprintf(buf, len, "%llu", (unsigned long long)bytes);
+        return buf;
+    }
+
+    static const char *units[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+    double value = (double)bytes;
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < sizeof(units) / sizeof(units[0])) {
+        value /= 1024.0;
+        unit++;
+    }
+
+    if (unit == 0) snprintf(buf, len, "%llu B", (unsigned long long)bytes);
+    else if (value >= 100.0) snprintf(buf, len, "%.0f %s", value, units[unit]);
+    else if (value >= 10.0) snprintf(buf, len, "%.1f %s", value, units[unit]);
+    else snprintf(buf, len, "%.2f %s", value, units[unit]);
+    return buf;
+}
+
 static void print_text(struct report_ctx *ctx, const struct report_opts *o, const char *label) {
     size_t n = 0;
     uint64_t ip_rx = 0, ip_tx = 0;
@@ -204,38 +226,51 @@ static void print_text(struct report_ctx *ctx, const struct report_opts *o, cons
     uint64_t kernel_total = ctx->kernel_rx_total + ctx->kernel_tx_total;
     uint64_t ip_total = ip_rx + ip_tx;
     size_t limit = (o->top_n > 0 && (size_t)o->top_n < n) ? (size_t)o->top_n : n;
+    const char *rx_label = o->human ? "RX" : "RX bytes";
+    const char *tx_label = o->human ? "TX" : "TX bytes";
+    const char *total_label = o->human ? "Total" : "Total bytes";
     printf("=== netacct %s iface=%s ===\n", label, o->iface);
-    printf("%-15s %14s %14s %14s %9s\n", "IP", "RX bytes", "TX bytes", "Total bytes", "%kernel");
+    printf("%-15s %14s %14s %14s %9s\n", "IP", rx_label, tx_label, total_label, "%kernel");
     for (size_t i = 0; i < limit; i++) {
         struct in_addr a = { .s_addr = rows[i].ip };
         char ipbuf[INET_ADDRSTRLEN];
+        char rxbuf[32], txbuf[32], totalbuf[32];
         inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
         uint64_t total = rows[i].rx + rows[i].tx;
-        printf("%-15s %14llu %14llu %14llu %8.2f%%\n", ipbuf,
-               (unsigned long long)rows[i].rx,
-               (unsigned long long)rows[i].tx,
-               (unsigned long long)total,
+        printf("%-15s %14s %14s %14s %8.2f%%\n", ipbuf,
+               format_bytes(rows[i].rx, o->human, rxbuf, sizeof(rxbuf)),
+               format_bytes(rows[i].tx, o->human, txbuf, sizeof(txbuf)),
+               format_bytes(total, o->human, totalbuf, sizeof(totalbuf)),
                pct(total, kernel_total));
     }
     if (limit < n) printf("... %zu more IPs hidden by --top %d\n", n - limit, o->top_n);
-    printf("%-15s %14llu %14llu %14llu %8.2f%%\n", "ALL(per-IP)",
-           (unsigned long long)ip_rx, (unsigned long long)ip_tx,
-           (unsigned long long)ip_total, pct(ip_total, kernel_total));
-    printf("%-15s %14llu %14llu %14llu %8.2f%%\n", "KERNEL",
-           (unsigned long long)ctx->kernel_rx_total,
-           (unsigned long long)ctx->kernel_tx_total,
-           (unsigned long long)kernel_total, 100.0);
+    char rxbuf[32], txbuf[32], totalbuf[32], gapbuf[32];
+    printf("%-15s %14s %14s %14s %8.2f%%\n", "ALL(per-IP)",
+           format_bytes(ip_rx, o->human, rxbuf, sizeof(rxbuf)),
+           format_bytes(ip_tx, o->human, txbuf, sizeof(txbuf)),
+           format_bytes(ip_total, o->human, totalbuf, sizeof(totalbuf)),
+           pct(ip_total, kernel_total));
+    printf("%-15s %14s %14s %14s %8.2f%%\n", "KERNEL",
+           format_bytes(ctx->kernel_rx_total, o->human, rxbuf, sizeof(rxbuf)),
+           format_bytes(ctx->kernel_tx_total, o->human, txbuf, sizeof(txbuf)),
+           format_bytes(kernel_total, o->human, totalbuf, sizeof(totalbuf)),
+           100.0);
     if (kernel_total >= ip_total) {
-        printf("coverage_gap_bytes=%llu coverage_gap_percent=%.4f%%\n",
-               (unsigned long long)(kernel_total - ip_total), pct(kernel_total - ip_total, kernel_total));
+        uint64_t gap = kernel_total - ip_total;
+        printf("coverage_gap=%s coverage_gap_bytes=%llu coverage_gap_percent=%.4f%%\n",
+               format_bytes(gap, o->human, gapbuf, sizeof(gapbuf)),
+               (unsigned long long)gap, pct(gap, kernel_total));
     } else {
-        printf("over_account_bytes=%llu over_account_percent=%.4f%%\n",
-               (unsigned long long)(ip_total - kernel_total), pct(ip_total - kernel_total, kernel_total));
+        uint64_t over = ip_total - kernel_total;
+        printf("over_account=%s over_account_bytes=%llu over_account_percent=%.4f%%\n",
+               format_bytes(over, o->human, gapbuf, sizeof(gapbuf)),
+               (unsigned long long)over, pct(over, kernel_total));
     }
     free(rows);
 }
 
 static void print_csv(struct report_ctx *ctx, const struct report_opts *o, const char *label) {
+    (void)o;
     size_t n = 0;
     uint64_t ip_rx = 0, ip_tx = 0;
     struct row *rows = collect_rows(ctx, &n, &ip_rx, &ip_tx);
@@ -357,7 +392,7 @@ static int list_ifaces(const char *root) {
 static void usage_report(void) {
     fprintf(stderr,
             "Usage:\n"
-            "  netacct report --iface IFACE [--root DIR] (--day YYYY-MM-DD | --month YYYY-MM) [--format text|csv|json] [--top N]\n"
+            "  netacct report --iface IFACE [--root DIR] (--day YYYY-MM-DD | --month YYYY-MM) [--format text|csv|json] [--top N] [--human]\n"
             "  netacct list-ifaces [--root DIR]\n");
 }
 
@@ -380,6 +415,8 @@ int reporter_run(int argc, char **argv) {
         else if (strcmp(argv[i], "--day") == 0 && i + 1 < argc) snprintf(o.day, sizeof(o.day), "%s", argv[++i]);
         else if (strcmp(argv[i], "--month") == 0 && i + 1 < argc) snprintf(o.month, sizeof(o.month), "%s", argv[++i]);
         else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) snprintf(o.format, sizeof(o.format), "%s", argv[++i]);
+        else if (strcmp(argv[i], "--human") == 0) o.human = 1;
+        else if (strcmp(argv[i], "--bytes") == 0) o.human = 0;
         else if (strcmp(argv[i], "--top") == 0 && i + 1 < argc) { o.top_n = atoi(argv[++i]); if (o.top_n <= 0) o.top_n = NETACCT_DEFAULT_TOP_N; }
         else { fprintf(stderr, "unknown or incomplete report option: %s\n", argv[i]); usage_report(); return 1; }
     }
@@ -390,6 +427,10 @@ int reporter_run(int argc, char **argv) {
     }
     if (strcmp(o.format, "text") != 0 && strcmp(o.format, "csv") != 0 && strcmp(o.format, "json") != 0) {
         fprintf(stderr, "invalid format: %s\n", o.format);
+        return 1;
+    }
+    if (o.human && strcmp(o.format, "text") != 0) {
+        fprintf(stderr, "--human is only supported with --format text\n");
         return 1;
     }
     return o.day[0] ? report_day(&o) : report_month(&o);
