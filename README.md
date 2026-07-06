@@ -70,10 +70,16 @@ Lightweight defaults:
 
 ## Report
 
-Daily report:
+Daily report with exact byte values:
 
 ```bash
 ./bin/netacct report --iface eth0 --root /var/lib/netacct --day 2026-06-30
+```
+
+Human-readable text report:
+
+```bash
+./bin/netacct report --iface eth0 --root /var/lib/netacct --day 2026-06-30 --human
 ```
 
 Monthly report, by summing daily files:
@@ -82,13 +88,13 @@ Monthly report, by summing daily files:
 ./bin/netacct report --iface eth0 --root /var/lib/netacct --month 2026-06
 ```
 
-JSON output:
+JSON output keeps exact byte fields for scripts:
 
 ```bash
 ./bin/netacct report --iface eth0 --root /var/lib/netacct --day 2026-06-30 --format json
 ```
 
-CSV output:
+CSV output keeps exact byte fields for scripts:
 
 ```bash
 ./bin/netacct report --iface eth0 --root /var/lib/netacct --day 2026-06-30 --format csv
