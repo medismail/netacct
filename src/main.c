@@ -6,29 +6,31 @@
 
 static void print_usage(FILE *out) {
     fprintf(out,
-        "netacct - lightweight IPv4 accounting for one LAN interface\n\n"
+        "netacct - lightweight IPv4/IPv6 accounting for one LAN interface\n\n"
         "Usage:\n"
         "  netacct daemon [options]\n"
-        "  netacct report --iface IFACE [--root DIR] (--day YYYY-MM-DD | --month YYYY-MM) [--format text|csv|json] [--top N]\n"
+        "  netacct report --iface IFACE [--root DIR] (--day YYYY-MM-DD | --month YYYY-MM) [--format text|csv|json] [--top N] [--human]\n"
         "  netacct list-ifaces [--root DIR]\n\n"
         "Daemon options:\n"
         "  --config FILE           Load key=value config file\n"
         "  --iface IFACE           Interface to monitor, default eth0\n"
         "  --root DIR              Storage root, default /var/lib/netacct\n"
         "  --subnet CIDR|auto      Local IPv4 subnet to account, default auto from IFACE\n"
+        "  --subnet6 CIDR|auto     Local IPv6 subnet to account, default auto from IFACE\n"
         "  --poll-interval SEC     Kernel counter poll interval, default 1\n"
         "  --flush-interval SEC    Storage flush interval, default 5\n"
         "  --pcap-buffer-mb MB     libpcap kernel buffer, default 4\n\n"
         "Example:\n"
-        "  sudo ./bin/netacct daemon --iface eth0 --subnet auto --root /var/lib/netacct\n"
-        "  ./bin/netacct report --iface eth0 --day 2026-06-30 --root /var/lib/netacct\n");
+        "  sudo ./bin/netacct daemon --iface eth0 --subnet auto --subnet6 auto --root /var/lib/netacct\n"
+        "  ./bin/netacct report --iface eth0 --day 2026-06-30 --root /var/lib/netacct --human\n");
 }
 
 static int is_option_with_value(const char *arg) {
     return strcmp(arg, "--config") == 0 || strcmp(arg, "--iface") == 0 ||
            strcmp(arg, "--interface") == 0 || strcmp(arg, "--root") == 0 ||
            strcmp(arg, "--root-dir") == 0 || strcmp(arg, "--subnet") == 0 ||
-           strcmp(arg, "--local-subnet") == 0 || strcmp(arg, "--poll-interval") == 0 ||
+           strcmp(arg, "--local-subnet") == 0 || strcmp(arg, "--subnet6") == 0 ||
+           strcmp(arg, "--local-subnet6") == 0 || strcmp(arg, "--poll-interval") == 0 ||
            strcmp(arg, "--flush-interval") == 0 || strcmp(arg, "--pcap-buffer-mb") == 0 ||
            strcmp(arg, "--top") == 0;
 }
@@ -107,9 +109,9 @@ int main(int argc, char **argv) {
     if (collector_init(&cfg) != 0) return 1;
 
     fprintf(stderr,
-            "[netacct] iface=%s root=%s subnet=%s poll=%ds flush=%ds pcap_buffer=%dMB\n",
-            cfg.iface, cfg.root_dir, cfg.subnet_text, cfg.poll_interval,
-            cfg.flush_interval, cfg.pcap_buffer_mb);
+            "[netacct] iface=%s root=%s subnet=%s subnet6=%s poll=%ds flush=%ds pcap_buffer=%dMB\n",
+            cfg.iface, cfg.root_dir, cfg.subnet_text, cfg.subnet6_text,
+            cfg.poll_interval, cfg.flush_interval, cfg.pcap_buffer_mb);
 
     return collector_run(&cfg);
 }
