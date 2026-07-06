@@ -1,5 +1,5 @@
 [Unit]
-Description=netacct IPv4 LAN accounting
+Description=netacct IPv4/IPv6 LAN accounting
 Documentation=https://github.com/medismail/netacct
 After=network-online.target
 Wants=network-online.target
