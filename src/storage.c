@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -74,6 +75,28 @@ static int copy_fd(int from, int to) {
     }
 }
 
+static int write_record_entry(int fd, const struct ip_record *rec) {
+    if (rec->addr.ipv == NETACCT_IPV4) {
+        struct ip_entry_v4_on_disk e;
+        memset(&e, 0, sizeof(e));
+        e.ipv = NETACCT_IPV4;
+        memcpy(&e.addr, rec->addr.bytes, sizeof(e.addr));
+        e.rx_delta = rec->rx;
+        e.tx_delta = rec->tx;
+        return write(fd, &e, sizeof(e)) == (ssize_t)sizeof(e) ? 0 : -1;
+    }
+    if (rec->addr.ipv == NETACCT_IPV6) {
+        struct ip_entry_v6_on_disk e;
+        memset(&e, 0, sizeof(e));
+        e.ipv = NETACCT_IPV6;
+        memcpy(e.addr, rec->addr.bytes, NETACCT_ADDR_BYTES);
+        e.rx_delta = rec->rx;
+        e.tx_delta = rec->tx;
+        return write(fd, &e, sizeof(e)) == (ssize_t)sizeof(e) ? 0 : -1;
+    }
+    return -1;
+}
+
 int storage_append_daily(const char *root_dir, const char *iface,
                          uint32_t ts, uint64_t rx_delta, uint64_t tx_delta,
                          uint16_t ip_count, const void *ip_entries_void, size_t ip_entries_len) {
@@ -99,13 +122,7 @@ int storage_append_daily(const char *root_dir, const char *iface,
 
     const struct ip_record *ip_entries = (const struct ip_record *)ip_entries_void;
     for (uint16_t i = 0; i < ip_count; ++i) {
-        struct ip_entry_on_disk e;
-        e.ipv = 4;
-        e.pad = 0;
-        e.addr = ip_entries[i].ip;
-        e.rx_delta = ip_entries[i].rx;
-        e.tx_delta = ip_entries[i].tx;
-        if (write(tfd, &e, sizeof(e)) != (ssize_t)sizeof(e)) { close(tfd); unlink(tmpfile); return -1; }
+        if (write_record_entry(tfd, &ip_entries[i]) != 0) { close(tfd); unlink(tmpfile); return -1; }
     }
 
     if (fsync(tfd) != 0) { close(tfd); unlink(tmpfile); return -1; }
