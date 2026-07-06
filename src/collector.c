@@ -32,6 +32,18 @@ int collector_init(struct cfg *cfg) {
         cfg->has_local_net = 1;
     }
 
+    if (!cfg->has_local6_net) {
+        if (detect_iface_ipv6_network(cfg->iface, cfg->local6_net, &cfg->local6_prefix,
+                                      cfg->subnet6_text, sizeof(cfg->subnet6_text)) == 0) {
+            cfg->has_local6_net = 1;
+        } else {
+            snprintf(cfg->subnet6_text, sizeof(cfg->subnet6_text), "disabled");
+            fprintf(stderr,
+                    "[collector] IPv6 accounting disabled: cannot auto-detect IPv6 subnet for %s. Use --subnet6 PREFIX/LEN to force it.\n",
+                    cfg->iface);
+        }
+    }
+
     memset(&g_iface, 0, sizeof(g_iface));
     snprintf(g_iface.name, sizeof(g_iface.name), "%s", cfg->iface);
     if (pthread_mutex_init(&g_iface.lock, NULL) != 0) {
@@ -49,11 +61,13 @@ static void log_flush_stats(uint32_t ts, uint64_t kernel_rx, uint64_t kernel_tx,
     struct pcap_runtime_stats ps;
     pcap_get_runtime_stats(&ps);
     fprintf(stderr,
-            "[flush] ts=%u kernel_rx=%llu kernel_tx=%llu ip_records=%d pcap_recv=%u pcap_drop=%u pcap_ifdrop=%u accounted_l2=%llu\n",
+            "[flush] ts=%u kernel_rx=%llu kernel_tx=%llu ip_records=%d ipv4_packets=%llu ipv6_packets=%llu pcap_recv=%u pcap_drop=%u pcap_ifdrop=%u accounted_l2=%llu\n",
             ts,
             (unsigned long long)kernel_rx,
             (unsigned long long)kernel_tx,
             ipn,
+            (unsigned long long)ps.ipv4_packets,
+            (unsigned long long)ps.ipv6_packets,
             ps.pcap_recv,
             ps.pcap_drop,
             ps.pcap_ifdrop,
