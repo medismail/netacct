@@ -11,6 +11,7 @@
 #include "netacct.h"
 
 #define HASH_SIZE 1024
+#define IP_COL_WIDTH 45
 
 struct record_header {
     uint32_t ts;
@@ -20,7 +21,7 @@ struct record_header {
 } __attribute__((packed));
 
 struct ip_total {
-    uint32_t ip;
+    struct netacct_addr addr;
     uint64_t rx;
     uint64_t tx;
     struct ip_total *next;
@@ -43,7 +44,7 @@ struct report_opts {
 };
 
 struct row {
-    uint32_t ip;
+    struct netacct_addr addr;
     uint64_t rx;
     uint64_t tx;
 };
@@ -56,18 +57,32 @@ static void report_opts_defaults(struct report_opts *o) {
     o->top_n = NETACCT_DEFAULT_TOP_N;
 }
 
-static unsigned ip_hash(uint32_t ip) {
-    return (ip ^ (ip >> 16)) % HASH_SIZE;
+static unsigned addr_hash(const struct netacct_addr *addr) {
+    uint32_t h = 2166136261u;
+    h ^= addr->ipv;
+    h *= 16777619u;
+    size_t len = (addr->ipv == NETACCT_IPV4) ? 4 : NETACCT_ADDR_BYTES;
+    for (size_t i = 0; i < len; i++) {
+        h ^= addr->bytes[i];
+        h *= 16777619u;
+    }
+    return h % HASH_SIZE;
 }
 
-static struct ip_total *get_total(struct report_ctx *ctx, uint32_t ip) {
-    unsigned h = ip_hash(ip);
+static int addr_equal(const struct netacct_addr *a, const struct netacct_addr *b) {
+    if (a->ipv != b->ipv) return 0;
+    size_t len = (a->ipv == NETACCT_IPV4) ? 4 : NETACCT_ADDR_BYTES;
+    return memcmp(a->bytes, b->bytes, len) == 0;
+}
+
+static struct ip_total *get_total(struct report_ctx *ctx, const struct netacct_addr *addr) {
+    unsigned h = addr_hash(addr);
     for (struct ip_total *e = ctx->totals[h]; e; e = e->next) {
-        if (e->ip == ip) return e;
+        if (addr_equal(&e->addr, addr)) return e;
     }
     struct ip_total *e = calloc(1, sizeof(*e));
     if (!e) return NULL;
-    e->ip = ip;
+    e->addr = *addr;
     e->next = ctx->totals[h];
     ctx->totals[h] = e;
     return e;
@@ -124,6 +139,27 @@ static void data_close(void *fh, int is_gzip) {
     else fclose((FILE *)fh);
 }
 
+static int read_entry(void *fh, int is_gzip, struct netacct_addr *addr, uint64_t *rx, uint64_t *tx) {
+    uint8_t prefix[2];
+    if (data_read(fh, is_gzip, prefix, sizeof(prefix)) != sizeof(prefix)) return -1;
+    memset(addr, 0, sizeof(*addr));
+    addr->ipv = prefix[0];
+
+    if (addr->ipv == NETACCT_IPV4) {
+        uint32_t ipv4;
+        if (data_read(fh, is_gzip, &ipv4, sizeof(ipv4)) != sizeof(ipv4)) return -1;
+        memcpy(addr->bytes, &ipv4, sizeof(ipv4));
+    } else if (addr->ipv == NETACCT_IPV6) {
+        if (data_read(fh, is_gzip, addr->bytes, NETACCT_ADDR_BYTES) != NETACCT_ADDR_BYTES) return -1;
+    } else {
+        return -1;
+    }
+
+    if (data_read(fh, is_gzip, rx, sizeof(*rx)) != sizeof(*rx)) return -1;
+    if (data_read(fh, is_gzip, tx, sizeof(*tx)) != sizeof(*tx)) return -1;
+    return 0;
+}
+
 static int process_file(struct report_ctx *ctx, const char *path) {
     int is_gzip = 0;
     void *fh = open_data_file(path, &is_gzip);
@@ -138,16 +174,16 @@ static int process_file(struct report_ctx *ctx, const char *path) {
             return -1;
         }
         for (uint16_t i = 0; i < h.ip_count; i++) {
-            struct ip_entry_on_disk rec;
-            if (data_read(fh, is_gzip, &rec, sizeof(rec)) != sizeof(rec)) {
+            struct netacct_addr addr;
+            uint64_t rx = 0, tx = 0;
+            if (read_entry(fh, is_gzip, &addr, &rx, &tx) != 0) {
                 data_close(fh, is_gzip);
                 return -1;
             }
-            if (rec.ipv != 4) continue;
-            struct ip_total *t = get_total(ctx, rec.addr);
+            struct ip_total *t = get_total(ctx, &addr);
             if (!t) { data_close(fh, is_gzip); return -1; }
-            t->rx += rec.rx_delta;
-            t->tx += rec.tx_delta;
+            t->rx += rx;
+            t->tx += tx;
         }
     }
     data_close(fh, is_gzip);
@@ -178,7 +214,7 @@ static struct row *collect_rows(struct report_ctx *ctx, size_t *out_count,
                 if (!nr) { free(rows); return NULL; }
                 rows = nr;
             }
-            rows[n].ip = e->ip;
+            rows[n].addr = e->addr;
             rows[n].rx = e->rx;
             rows[n].tx = e->tx;
             ip_rx += e->rx;
@@ -230,14 +266,13 @@ static void print_text(struct report_ctx *ctx, const struct report_opts *o, cons
     const char *tx_label = o->human ? "TX" : "TX bytes";
     const char *total_label = o->human ? "Total" : "Total bytes";
     printf("=== netacct %s iface=%s ===\n", label, o->iface);
-    printf("%-15s %14s %14s %14s %9s\n", "IP", rx_label, tx_label, total_label, "%kernel");
+    printf("%-*s %3s %14s %14s %14s %9s\n", IP_COL_WIDTH, "IP", "ver", rx_label, tx_label, total_label, "%kernel");
     for (size_t i = 0; i < limit; i++) {
-        struct in_addr a = { .s_addr = rows[i].ip };
-        char ipbuf[INET_ADDRSTRLEN];
+        char ipbuf[INET6_ADDRSTRLEN];
         char rxbuf[32], txbuf[32], totalbuf[32];
-        inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
+        format_netacct_addr(&rows[i].addr, ipbuf, sizeof(ipbuf));
         uint64_t total = rows[i].rx + rows[i].tx;
-        printf("%-15s %14s %14s %14s %8.2f%%\n", ipbuf,
+        printf("%-*s %3u %14s %14s %14s %8.2f%%\n", IP_COL_WIDTH, ipbuf, rows[i].addr.ipv,
                format_bytes(rows[i].rx, o->human, rxbuf, sizeof(rxbuf)),
                format_bytes(rows[i].tx, o->human, txbuf, sizeof(txbuf)),
                format_bytes(total, o->human, totalbuf, sizeof(totalbuf)),
@@ -245,12 +280,12 @@ static void print_text(struct report_ctx *ctx, const struct report_opts *o, cons
     }
     if (limit < n) printf("... %zu more IPs hidden by --top %d\n", n - limit, o->top_n);
     char rxbuf[32], txbuf[32], totalbuf[32], gapbuf[32];
-    printf("%-15s %14s %14s %14s %8.2f%%\n", "ALL(per-IP)",
+    printf("%-*s %3s %14s %14s %14s %8.2f%%\n", IP_COL_WIDTH, "ALL(per-IP)", "",
            format_bytes(ip_rx, o->human, rxbuf, sizeof(rxbuf)),
            format_bytes(ip_tx, o->human, txbuf, sizeof(txbuf)),
            format_bytes(ip_total, o->human, totalbuf, sizeof(totalbuf)),
            pct(ip_total, kernel_total));
-    printf("%-15s %14s %14s %14s %8.2f%%\n", "KERNEL",
+    printf("%-*s %3s %14s %14s %14s %8.2f%%\n", IP_COL_WIDTH, "KERNEL", "",
            format_bytes(ctx->kernel_rx_total, o->human, rxbuf, sizeof(rxbuf)),
            format_bytes(ctx->kernel_tx_total, o->human, txbuf, sizeof(txbuf)),
            format_bytes(kernel_total, o->human, totalbuf, sizeof(totalbuf)),
@@ -270,27 +305,25 @@ static void print_text(struct report_ctx *ctx, const struct report_opts *o, cons
 }
 
 static void print_csv(struct report_ctx *ctx, const struct report_opts *o, const char *label) {
-    (void)o;
     size_t n = 0;
     uint64_t ip_rx = 0, ip_tx = 0;
     struct row *rows = collect_rows(ctx, &n, &ip_rx, &ip_tx);
     if (!rows) return;
     uint64_t kernel_total = ctx->kernel_rx_total + ctx->kernel_tx_total;
     size_t limit = (o->top_n > 0 && (size_t)o->top_n < n) ? (size_t)o->top_n : n;
-    printf("label,type,ip,rx_bytes,tx_bytes,total_bytes,pct_kernel\n");
+    printf("label,type,ip_version,ip,rx_bytes,tx_bytes,total_bytes,pct_kernel\n");
     for (size_t i = 0; i < limit; i++) {
-        struct in_addr a = { .s_addr = rows[i].ip };
-        char ipbuf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
+        char ipbuf[INET6_ADDRSTRLEN];
+        format_netacct_addr(&rows[i].addr, ipbuf, sizeof(ipbuf));
         uint64_t total = rows[i].rx + rows[i].tx;
-        printf("%s,ip,%s,%llu,%llu,%llu,%.4f\n", label, ipbuf,
+        printf("%s,ip,%u,%s,%llu,%llu,%llu,%.4f\n", label, rows[i].addr.ipv, ipbuf,
                (unsigned long long)rows[i].rx, (unsigned long long)rows[i].tx,
                (unsigned long long)total, pct(total, kernel_total));
     }
-    printf("%s,all_per_ip,,%llu,%llu,%llu,%.4f\n", label,
+    printf("%s,all_per_ip,,,%llu,%llu,%llu,%.4f\n", label,
            (unsigned long long)ip_rx, (unsigned long long)ip_tx,
            (unsigned long long)(ip_rx + ip_tx), pct(ip_rx + ip_tx, kernel_total));
-    printf("%s,kernel,,%llu,%llu,%llu,100.0000\n", label,
+    printf("%s,kernel,,,%llu,%llu,%llu,100.0000\n", label,
            (unsigned long long)ctx->kernel_rx_total, (unsigned long long)ctx->kernel_tx_total,
            (unsigned long long)kernel_total);
     free(rows);
@@ -314,12 +347,11 @@ static void print_json(struct report_ctx *ctx, const struct report_opts *o, cons
            (unsigned long long)(ip_rx + ip_tx), pct(ip_rx + ip_tx, kernel_total));
     printf("  \"ips\": [\n");
     for (size_t i = 0; i < limit; i++) {
-        struct in_addr a = { .s_addr = rows[i].ip };
-        char ipbuf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
+        char ipbuf[INET6_ADDRSTRLEN];
+        format_netacct_addr(&rows[i].addr, ipbuf, sizeof(ipbuf));
         uint64_t total = rows[i].rx + rows[i].tx;
-        printf("    {\"ip\": \"%s\", \"rx_bytes\": %llu, \"tx_bytes\": %llu, \"total_bytes\": %llu, \"pct_kernel\": %.6f}%s\n",
-               ipbuf, (unsigned long long)rows[i].rx, (unsigned long long)rows[i].tx,
+        printf("    {\"ip_version\": %u, \"ip\": \"%s\", \"rx_bytes\": %llu, \"tx_bytes\": %llu, \"total_bytes\": %llu, \"pct_kernel\": %.6f}%s\n",
+               rows[i].addr.ipv, ipbuf, (unsigned long long)rows[i].rx, (unsigned long long)rows[i].tx,
                (unsigned long long)total, pct(total, kernel_total), (i + 1 < limit) ? "," : "");
     }
     printf("  ]\n}\n");
