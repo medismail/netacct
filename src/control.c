@@ -13,6 +13,23 @@
 
 #define CONTROL_SOCK_PATH "/run/netacct.sock"
 
+static int parse_ip_any(const char *ipstr, uint8_t *ipv, uint8_t addr[NETACCT_ADDR_BYTES]) {
+    struct in_addr a4;
+    struct in6_addr a6;
+    memset(addr, 0, NETACCT_ADDR_BYTES);
+    if (inet_pton(AF_INET, ipstr, &a4) == 1) {
+        *ipv = NETACCT_IPV4;
+        memcpy(addr, &a4.s_addr, sizeof(a4.s_addr));
+        return 0;
+    }
+    if (inet_pton(AF_INET6, ipstr, &a6) == 1) {
+        *ipv = NETACCT_IPV6;
+        memcpy(addr, a6.s6_addr, NETACCT_ADDR_BYTES);
+        return 0;
+    }
+    return -1;
+}
+
 static void handle_command(const char *line) {
     cJSON *root = cJSON_Parse(line);
     if (!root) {
@@ -24,25 +41,26 @@ static void handle_command(const char *line) {
     cJSON *ip_item = cJSON_GetObjectItemCaseSensitive(root, "ip");
 
     if (!cJSON_IsString(action_item) || !cJSON_IsString(ip_item)) {
-        fprintf(stderr, "[control] invalid JSON; expected {\"action\":\"add|del\",\"ip\":\"A.B.C.D\"}\n");
+        fprintf(stderr, "[control] invalid JSON; expected {\"action\":\"add|del\",\"ip\":\"address\"}\n");
         cJSON_Delete(root);
         return;
     }
 
     const char *action = action_item->valuestring;
     const char *ipstr = ip_item->valuestring;
-    struct in_addr addr;
-    if (inet_pton(AF_INET, ipstr, &addr) != 1) {
-        fprintf(stderr, "[control] invalid IPv4: %s\n", ipstr);
+    uint8_t ipv = 0;
+    uint8_t addr[NETACCT_ADDR_BYTES];
+    if (parse_ip_any(ipstr, &ipv, addr) != 0) {
+        fprintf(stderr, "[control] invalid IP address: %s\n", ipstr);
         cJSON_Delete(root);
         return;
     }
 
     if (strcmp(action, "add") == 0) {
-        ipacct_add_client(addr.s_addr);
+        ipacct_add_client(ipv, addr);
         fprintf(stderr, "[control] added %s\n", ipstr);
     } else if (strcmp(action, "del") == 0) {
-        ipacct_del_client(addr.s_addr);
+        ipacct_del_client(ipv, addr);
         fprintf(stderr, "[control] removed %s\n", ipstr);
     } else {
         fprintf(stderr, "[control] unknown action: %s\n", action);
