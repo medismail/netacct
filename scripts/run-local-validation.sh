@@ -18,11 +18,11 @@ TX0=$(cat "/sys/class/net/$IFACE/statistics/tx_bytes")
 rm -rf "$ROOT"
 mkdir -p "$ROOT"
 
-sudo "$BIN" daemon --iface "$IFACE" --root "$ROOT" --subnet auto --poll-interval 1 --flush-interval 2 &
+sudo "$BIN" daemon --iface "$IFACE" --root "$ROOT" --subnet auto --subnet6 auto --poll-interval 1 --flush-interval 2 &
 PID=$!
 trap 'sudo kill -TERM "$PID" 2>/dev/null || true' INT TERM EXIT
 
-echo "netacct running for ${DURATION}s on $IFACE. Generate traffic now, for example: iperf3/wget/speedtest."
+echo "netacct running for ${DURATION}s on $IFACE. Generate IPv4 and/or IPv6 traffic now, for example: iperf3/wget/speedtest."
 sleep "$DURATION"
 
 sudo kill -TERM "$PID" 2>/dev/null || true
@@ -37,7 +37,7 @@ SYS_TOTAL=$((SYS_RX + SYS_TX))
 
 REPORT=$($BIN report --iface "$IFACE" --root "$ROOT" --day "$TODAY" --format csv --top 9999)
 echo "$REPORT"
-NET_TOTAL=$(printf '%s\n' "$REPORT" | awk -F, '$2=="kernel" {print $6}')
+NET_TOTAL=$(printf '%s\n' "$REPORT" | awk -F, '$2=="kernel" {print $7}')
 
 if [ -n "$NET_TOTAL" ] && [ "$SYS_TOTAL" -gt 0 ]; then
   DIFF=$((NET_TOTAL - SYS_TOTAL))
