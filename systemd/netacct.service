@@ -1,0 +1,23 @@
+[Unit]
+Description=netacct IPv4/IPv6 LAN accounting
+Documentation=https://github.com/medismail/netacct
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/netacct daemon --config /etc/netacct.conf
+Restart=on-failure
+RestartSec=3
+# CAP_NET_RAW is needed for libpcap capture. Root is simplest for the MVP on Raspberry Pi.
+User=root
+Group=root
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/netacct /run
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+# netacct MVP configuration for a small IPv4/IPv6 LAN router
+# Debian/Raspberry Pi OS example: /etc/netacct.conf
+
+# LAN interface to monitor. On Raspberry Pi it may be eth0, end0, wlan0, br-lan, etc.
+iface=eth0
+
+# Storage root. Daily files are written under /var/lib/netacct/<iface>/daily/.
+root_dir=/var/lib/netacct
+
+# Auto-detect local IPv4 subnet from the interface address/netmask.
+# You can force it, for example: subnet=192.168.1.0/24
+subnet=auto
+
+# Auto-detect local IPv6 prefix from the interface address/netmask.
+# You can force it, for example: subnet6=fd00:1234:5678::/64
+subnet6=auto
+
+# Lightweight defaults suitable for Raspberry Pi 3 B+.
+poll_interval=1
+flush_interval=5
+pcap_buffer_mb=4
+
+# Reporter default, used only when passed through config-aware wrappers.
+top=50
